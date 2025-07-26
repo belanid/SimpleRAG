@@ -167,6 +167,52 @@ def get_top_k_results(
             print("\n" + "-"*100 + "\n")
     return scores, indices
 
+
+def prompt_augmenter(query: str, context_items: list[dict], tokenizer) -> str:
+    """
+    Augments query with text-based context from context_items.
+    """
+    # Join context items into one dotted paragraph
+    context = "- " + "\n- ".join([item["text"] for item in context_items])
+
+    # Create a base prompt with examples to help the model
+    # Note: this is very customizable, I've chosen to use 3 examples of the answer style we'd like.
+    # We could also write this in a txt file and import it in if we wanted.
+    base_prompt = """Based on the following context items, please answer the query.
+    Give yourself room to think by extracting relevant passages from the context before answering the query.
+    Don't return the thinking, only return the answer.
+    Make sure your answers are as explanatory as possible.
+    Use the following examples as reference for the ideal answer style.
+    \nExample 1:
+    Query: What are the fat-soluble vitamins?
+    Answer: The fat-soluble vitamins include Vitamin A, Vitamin D, Vitamin E, and Vitamin K. These vitamins are absorbed along with fats in the diet and can be stored in the body's fatty tissue and liver for later use. Vitamin A is important for vision, immune function, and skin health. Vitamin D plays a critical role in calcium absorption and bone health. Vitamin E acts as an antioxidant, protecting cells from damage. Vitamin K is essential for blood clotting and bone metabolism.
+    \nExample 2:
+    Query: What are the causes of type 2 diabetes?
+    Answer: Type 2 diabetes is often associated with overnutrition, particularly the overconsumption of calories leading to obesity. Factors include a diet high in refined sugars and saturated fats, which can lead to insulin resistance, a condition where the body's cells do not respond effectively to insulin. Over time, the pancreas cannot produce enough insulin to manage blood sugar levels, resulting in type 2 diabetes. Additionally, excessive caloric intake without sufficient physical activity exacerbates the risk by promoting weight gain and fat accumulation, particularly around the abdomen, further contributing to insulin resistance.
+    \nExample 3:
+    Query: What is the importance of hydration for physical performance?
+    Answer: Hydration is crucial for physical performance because water plays key roles in maintaining blood volume, regulating body temperature, and ensuring the transport of nutrients and oxygen to cells. Adequate hydration is essential for optimal muscle function, endurance, and recovery. Dehydration can lead to decreased performance, fatigue, and increased risk of heat-related illnesses, such as heat stroke. Drinking sufficient water before, during, and after exercise helps ensure peak physical performance and recovery.
+    \nNow use the following context items to answer the user query:
+    {context}
+    \nRelevant passages: <extract relevant passages from the context here>
+    User query: {query}
+    Answer:"""
+
+    # Update base prompt with context items and query   
+    base_prompt = base_prompt.format(context=context, query=query)
+
+    # Create prompt template for instruction-tuned model
+    dialogue_template = [
+        {"role": "user",
+        "content": base_prompt}
+    ]
+
+    # Apply the chat template
+    prompt = tokenizer.apply_chat_template(conversation=dialogue_template,
+                                          tokenize=False,
+                                          add_generation_prompt=True)
+    return prompt
+
 def ask_pdf(
     query: str,
     pdf_path: str,
@@ -193,7 +239,8 @@ def ask_pdf(
     # 2. Get the top k closest embedding chunks to the query
     scores, indices = get_top_k_results(query, embeddings, embedder, pdf_chunks, top_k=top_k, verbose=False)
     # 3. Setup a quantization config
-    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+    quantization_config = BitsAndBytesConfig(load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16)
     # 4. Load the LLM model
     model = AutoModelForCausalLM.from_pretrained(
         llm_model_name,
@@ -204,11 +251,7 @@ def ask_pdf(
     # 5. Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(llm_model_name, device_map=device)
     # 6. Format the query
-    user_prompt = query
-    chat = [
-        {"role": "user", "content": user_prompt},
-    ]
-    prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+    prompt = prompt_augmenter(query,[pdf_chunks[i] for i in indices.cpu().numpy()], tokenizer)
     # 7. Tokenize the prompt
     inputs = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").to(device)
     # 8. Generate the response
@@ -217,4 +260,77 @@ def ask_pdf(
         max_new_tokens=max_new_tokens
     )
     # 9. Decode (de-tokenize) the response and print
-    print_wrapped_text(tokenizer.decode(outputs[0], skip_special_tokens=True))
+    output_text = tokenizer.decode(outputs[0])
+    print_wrapped_text(output_text.replace(prompt, ""))
+
+
+class AskPDF:
+    def __init__(
+        self,
+        pdf_path: str,
+        chunk_size: int = 10,
+        token_count_threshold: int = 30,
+        embedding_model_name: str = "all-mpnet-base-v2",
+        llm_model_name: str = "google/gemma-2-2b-it",
+        device: str = "auto",
+        max_new_tokens: int = 50,
+        top_k: int = 5
+    ):
+        # Store config
+        self.pdf_path = pdf_path
+        self.chunk_size = chunk_size
+        self.token_count_threshold = token_count_threshold
+        self.embedding_model_name = embedding_model_name
+        self.llm_model_name = llm_model_name
+        self.max_new_tokens = max_new_tokens
+        self.top_k = top_k
+        # Determine device
+        if device == "auto":
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+
+        # 1. Create or load embeddings
+        print("[AskPDF tool] Loading embeddings and embedder...")
+        self.pdf_chunks, self.embeddings, self.embedder = create_embedding_from_pdf(
+            pdf_path,
+            chunk_size=self.chunk_size,
+            token_count_threshold=self.token_count_threshold,
+            embedding_model_name=self.embedding_model_name
+        )
+
+        # 2. Load LLM & tokenizer
+        print("[AskPDF tool] Loading LLM model and tokenizer...")
+        quant_config = BitsAndBytesConfig(load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.llm_model_name,
+            quantization_config=quant_config,
+            device_map={"": self.device},
+            trust_remote_code=True
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(self.llm_model_name, device_map={"": self.device})
+        print("[AskPDF tool] Initialization complete.")
+
+    def answer(self, query: str) -> str:
+        # Retrieve top-k context chunks
+        scores, indices = get_top_k_results(
+            query,
+            self.embeddings,
+            self.embedder,
+            dict_chunks=self.pdf_chunks,
+            top_k=self.top_k,
+            verbose=False
+        )
+        # Prepare LLM prompt via chat template
+        prompt = prompt_augmenter(query, [self.pdf_chunks[i] for i in indices.cpu().numpy()], self.tokenizer)
+        inputs = self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt").to(self.device)
+        # Generate response
+        outputs = self.model.generate(
+            **inputs,
+            max_new_tokens=self.max_new_tokens
+        )
+        answer = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
+        answer = answer.replace(prompt, "")
+
+        return answer
