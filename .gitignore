@@ -5,4 +5,6 @@ venv/*
 
 .ipynb_checkpoints/* 
 
-text_chunks_and_embeddings_df.csv
+__pycache__/
+**/__pycache__/
+*.py[cod]
